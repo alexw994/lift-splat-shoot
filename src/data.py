@@ -14,6 +14,7 @@ from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.splits import create_splits_scenes
 from nuscenes.utils.data_classes import Box
 from glob import glob
+from torch.utils.data import DataLoader, DistributedSampler
 
 from .tools import get_lidar_data, img_transform, normalize_img, gen_dx_bx
 
@@ -133,7 +134,7 @@ class NuscData(torch.utils.data.Dataset):
             post_tran = torch.zeros(2)
 
             sens = self.nusc.get('calibrated_sensor', samp['calibrated_sensor_token'])
-            intrin = torch.Tensor(sens['camera_intrinsic'])
+            intrin = torch.Tensor(sens['camera_intrinsic']) # 内参
             rot = torch.Tensor(Quaternion(sens['rotation']).rotation_matrix)
             tran = torch.Tensor(sens['translation'])
 
@@ -242,7 +243,7 @@ def worker_rnd_init(x):
 
 
 def compile_data(version, dataroot, data_aug_conf, grid_conf, bsz,
-                 nworkers, parser_name):
+                 nworkers, parser_name, distributed=False):
     nusc = NuScenes(version='v1.0-{}'.format(version),
                     dataroot=os.path.join(dataroot, version),
                     verbose=False)
@@ -255,13 +256,23 @@ def compile_data(version, dataroot, data_aug_conf, grid_conf, bsz,
     valdata = parser(nusc, is_train=False, data_aug_conf=data_aug_conf,
                        grid_conf=grid_conf)
 
-    trainloader = torch.utils.data.DataLoader(traindata, batch_size=bsz,
-                                              shuffle=True,
+    if distributed:
+        sampler_train = DistributedSampler(traindata)
+        sampler_val = DistributedSampler(valdata, shuffle=False)
+    else:
+        sampler_train = torch.utils.data.RandomSampler(traindata)
+        sampler_val = torch.utils.data.SequentialSampler(valdata)
+
+
+    batch_sampler_train = torch.utils.data.BatchSampler(
+        sampler_train, bsz, drop_last=True)
+
+    trainloader = torch.utils.data.DataLoader(traindata, 
+                                              batch_sampler=batch_sampler_train,
                                               num_workers=nworkers,
-                                              drop_last=True,
                                               worker_init_fn=worker_rnd_init)
     valloader = torch.utils.data.DataLoader(valdata, batch_size=bsz,
-                                            shuffle=False,
+                                            sampler=sampler_val,
                                             num_workers=nworkers)
 
     return trainloader, valloader

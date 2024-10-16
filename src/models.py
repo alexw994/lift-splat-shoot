@@ -255,5 +255,17 @@ class LiftSplatShoot(nn.Module):
         return x
 
 
+def compile_model_train(grid_conf, data_aug_conf, outC, device='cpu', distributed=False, gpu=0):
+    model = LiftSplatShoot(grid_conf, data_aug_conf, outC)
+    model.to(device)
+
+    model_without_ddp = model
+    if distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu], find_unused_parameters=True)
+        model_without_ddp = model.module
+    
+    return model, model_without_ddp
+
+
 def compile_model(grid_conf, data_aug_conf, outC):
     return LiftSplatShoot(grid_conf, data_aug_conf, outC)

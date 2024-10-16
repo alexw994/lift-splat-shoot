@@ -9,16 +9,23 @@ from time import time
 from tensorboardX import SummaryWriter
 import numpy as np
 import os
+import tqdm
+import random
+import shutil
 
-from .models import compile_model
+from .models import compile_model_train
 from .data import compile_data
 from .tools import SimpleLoss, get_batch_iou, get_val_info
-
+from .utils import is_dist_avail_and_initialized, init_distributed_mode, get_rank, save_on_master, is_main_process
 
 def train(version,
             dataroot='/data/nuscenes',
             nepochs=10000,
-            gpuid=1,
+
+            modelf=None,
+            device='cuda',
+            gpuid=0,
+            world_size=1,
 
             H=900, W=1600,
             resize_lim=(0.193, 0.225),
@@ -58,26 +65,53 @@ def train(version,
                              'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'],
                     'Ncams': ncams,
                 }
+    
+    dist_conf = {'world_size': world_size,
+                 'dist_url': 'env://'}
+    
+    init_distributed_mode(dist_conf)
+    is_distributed = dist_conf['distributed']
+    if is_distributed:
+        gpu = dist_conf['gpu']
+    else:
+        if device == 'cuda':
+            gpu = gpuid
+        else:
+            gpu = None
+
+    seed = 42
+    seed = seed + get_rank()
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
     trainloader, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
                                           grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
-                                          parser_name='segmentationdata')
+                                          parser_name='segmentationdata', distributed=is_distributed)
 
-    device = torch.device('cpu') if gpuid < 0 else torch.device(f'cuda:{gpuid}')
+    model, model_without_ddp = compile_model_train(grid_conf, data_aug_conf, outC=1, 
+                                                    device=device, distributed=is_distributed, gpu=gpu)
 
-    model = compile_model(grid_conf, data_aug_conf, outC=1)
-    model.to(device)
+    opt = torch.optim.Adam(model_without_ddp.parameters(), lr=lr, weight_decay=weight_decay)
 
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    if modelf:
+        model_without_ddp.load_state_dict(torch.load(modelf))
+        opt.load_state_dict(torch.load(modelf.replace('model', 'opt')))
 
-    loss_fn = SimpleLoss(pos_weight).cuda(gpuid)
+    loss_fn = SimpleLoss(pos_weight).to(gpu)
 
     writer = SummaryWriter(logdir=logdir)
-    val_step = 1000 if version == 'mini' else 10000
+    val_step = 50 if version == 'mini' else 500
+
+    total = trainloader.batch_sampler.sampler.num_samples
+    print(get_rank(), f'per subdataset numbers:{trainloader.batch_sampler.sampler.num_samples}')
 
     model.train()
     counter = 0
     for epoch in range(nepochs):
-        np.random.seed()
+        if is_distributed:
+            trainloader.batch_sampler.sampler.set_epoch(epoch)
+
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in enumerate(trainloader):
             t0 = time()
             opt.zero_grad()
@@ -97,24 +131,34 @@ def train(version,
             t1 = time()
 
             if counter % 10 == 0:
-                print(counter, loss.item())
-                writer.add_scalar('train/loss', loss, counter)
+                if is_main_process():
+                    print(f'rank:{get_rank()} epoch:{epoch} counter:{counter} prog: {(100 * batchi * bsz / total):.2f}% loss:{loss.item():.3f} {((t1 - t0)):.2f}s/it')
+                    writer.add_scalar('train/loss', loss, counter)
 
             if counter % 50 == 0:
-                _, _, iou = get_batch_iou(preds, binimgs)
-                writer.add_scalar('train/iou', iou, counter)
-                writer.add_scalar('train/epoch', epoch, counter)
-                writer.add_scalar('train/step_time', t1 - t0, counter)
+                if is_main_process():
+                    _, _, iou = get_batch_iou(preds, binimgs)
+                    writer.add_scalar('train/iou', iou, counter)
+                    writer.add_scalar('train/epoch', epoch, counter)
+                    writer.add_scalar('train/step_time', t1 - t0, counter)
 
             if counter % val_step == 0:
-                val_info = get_val_info(model, valloader, loss_fn, device)
-                print('VAL', val_info)
-                writer.add_scalar('val/loss', val_info['loss'], counter)
-                writer.add_scalar('val/iou', val_info['iou'], counter)
+                if is_main_process():
+                    val_info = get_val_info(model, valloader, loss_fn, device)
+                    print('VAL', val_info)
+                    writer.add_scalar('val/loss', val_info['loss'], counter)
+                    writer.add_scalar('val/iou', val_info['iou'], counter)
 
             if counter % val_step == 0:
-                model.eval()
+                model_without_ddp.eval()
                 mname = os.path.join(logdir, "model{}.pt".format(counter))
                 print('saving', mname)
-                torch.save(model.state_dict(), mname)
-                model.train()
+                save_on_master(model_without_ddp.state_dict(), mname)
+                shutil.copy(mname, os.path.join(logdir, "model_latest.pt"))
+
+                oname = os.path.join(logdir, "opt{}.pt".format(counter))
+                print('saving', oname)
+                save_on_master(opt.state_dict(), oname)
+                shutil.copy(oname, os.path.join(logdir, "opt_latest.pt"))
+                
+                model_without_ddp.train()
