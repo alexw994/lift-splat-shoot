@@ -247,7 +247,7 @@ def get_val_info(model, valloader, loss_fn, device, use_tqdm=False):
     total_union = 0
     print('running eval...')
     loader = tqdm(valloader) if use_tqdm else valloader
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in loader:
             allimgs, rots, trans, intrins, post_rots, post_trans, binimgs = batch
             preds = model(allimgs.to(device), rots.to(device),

@@ -90,11 +90,6 @@ def is_main_process():
     return get_rank() == 0
 
 
-def save_on_master(*args, **kwargs):
-    if is_main_process():
-        torch.save(*args, **kwargs)
-
-
 def synchronize():
     """
     Helper function to synchronize (barrier) among all processes when

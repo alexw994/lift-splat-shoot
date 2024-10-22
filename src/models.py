@@ -143,7 +143,9 @@ class LiftSplatShoot(nn.Module):
         self.downsample = 16
         self.camC = 64
         self.frustum = self.create_frustum()
-        self.D, _, _, _ = self.frustum.shape
+        self.D, fH, fW, _ = self.frustum.shape
+
+        self.groundness = nn.Parameter(torch.arange(fH).float().softmax(-1))
         self.camencode = CamEncode(self.D, self.camC, self.downsample)
         self.bevencode = BevEncode(inC=self.camC, outC=outC)
 
@@ -196,6 +198,70 @@ class LiftSplatShoot(nn.Module):
         x = x.permute(0, 1, 3, 4, 5, 2)
 
         return x
+    
+    def spatial_squeeze(self, x, method='reshape'):
+        if method == 'reshape':
+            B, N, D, H, W, C = x.shape
+            x = x.permute(0, 1, 2, 4, 5, 3) # B, N, D, W, C, H
+            x = x.reshape(B, N, D, W, -1) # B, N, D, W, C*H
+            return x
+        elif method == 'groundness':
+            B, N, D, H, W, C = x.shape
+            groundness = self.groundness.view(1, 1, 1, H, 1, 1)
+            x = x * groundness
+            x = x.sum(3)
+            return x
+        elif method == 'max':
+            B, N, D, H, W, C = x.shape
+            x = x.max(3)
+            return x
+    
+    def voxel_flatten_pooling(self, geom_feats, x):
+        x = self.spatial_squeeze(x, method='groundness')
+        B, N, D, W, C = x.shape
+        Nprime = B*D*W
+
+        # flatten Y axis
+        geom_feats = ((geom_feats - (self.bx - self.dx/2.)) / self.dx)
+        geom_feats = geom_feats.mean(3).long()
+
+        # filter out points that are outside box
+        kept = (geom_feats[:, :, :, :, 0] >= 0) & (geom_feats[:, :, :, :,  0] < self.nx[0])\
+            & (geom_feats[:, :, :, :,  1] >= 0) & (geom_feats[:, :, :, :,  1] < self.nx[1])\
+            & (geom_feats[:, :, :, :, 2] >= 0) & (geom_feats[:, :, :, :, 2] < self.nx[2])
+
+        geom_feats = geom_feats.permute(1, 0, 2, 3, 4)
+        x = x.permute(1, 0, 2, 3, 4)
+        kept = kept.permute(1, 0, 2, 3)
+
+        geom_feats = geom_feats.reshape(N, Nprime, 3)
+        x = x.reshape(N, Nprime, C)
+        kept = kept.reshape(N, Nprime)
+
+
+        # griddify (B x C x Z x X x Y)
+        final = torch.zeros((B, C, self.nx[2], self.nx[0], self.nx[1]), device=x.device)
+        counter = torch.zeros((B, C, self.nx[2], self.nx[0], self.nx[1]), device=x.device, dtype=torch.int32)
+        batch_ix = torch.cat([torch.full([N, Nprime//B, 1], ix,
+                             device=x.device, dtype=torch.long) for ix in range(B)], dim=1)
+        geom_feats = torch.cat((geom_feats, batch_ix), 2)
+
+        for n in range(N):
+            _gf = geom_feats[n][kept[n]]
+            _x = x[n][kept[n]]
+            
+            final[_gf[:, 3], :, _gf[:, 2], _gf[:, 0], _gf[:, 1]] += _x
+            counter[_gf[:, 3], :, _gf[:, 2], _gf[:, 0], _gf[:, 1]] += 1
+
+        # average
+        mask = (counter!=0)
+        final[mask] /= counter[mask]
+
+        # collapse Z
+        final = torch.cat(final.unbind(dim=2), 1)
+
+        return final
+
 
     def voxel_pooling(self, geom_feats, x):
         B, N, D, H, W, C = x.shape
@@ -245,7 +311,8 @@ class LiftSplatShoot(nn.Module):
         geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
         x = self.get_cam_feats(x)
 
-        x = self.voxel_pooling(geom, x)
+        x = self.voxel_flatten_pooling(geom, x)
+        # x = self.voxel_pooling(geom, x)
 
         return x
 
@@ -261,6 +328,7 @@ def compile_model_train(grid_conf, data_aug_conf, outC, device='cpu', distribute
 
     model_without_ddp = model
     if distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu], find_unused_parameters=True)
         model_without_ddp = model.module
     

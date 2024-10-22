@@ -8,7 +8,6 @@ from fire import Fire
 
 import src
 
-
 if __name__ == '__main__':
     Fire({
         'lidar_check': src.explore.lidar_check,

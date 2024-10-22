@@ -16,12 +16,13 @@ import shutil
 from .models import compile_model_train
 from .data import compile_data
 from .tools import SimpleLoss, get_batch_iou, get_val_info
-from .utils import is_dist_avail_and_initialized, init_distributed_mode, get_rank, save_on_master, is_main_process
+from .utils import is_dist_avail_and_initialized, init_distributed_mode, get_rank, is_main_process
 
 def train(version,
             dataroot='/data/nuscenes',
             nepochs=10000,
 
+            backbone=None,
             modelf=None,
             device='cuda',
             gpuid=0,
@@ -70,8 +71,8 @@ def train(version,
                  'dist_url': 'env://'}
     
     init_distributed_mode(dist_conf)
-    is_distributed = dist_conf['distributed']
-    if is_distributed:
+    distributed = dist_conf['distributed']
+    if distributed:
         gpu = dist_conf['gpu']
     else:
         if device == 'cuda':
@@ -87,29 +88,44 @@ def train(version,
 
     trainloader, valloader = compile_data(version, dataroot, data_aug_conf=data_aug_conf,
                                           grid_conf=grid_conf, bsz=bsz, nworkers=nworkers,
-                                          parser_name='segmentationdata', distributed=is_distributed)
+                                          parser_name='segmentationdata', distributed=distributed)
 
     model, model_without_ddp = compile_model_train(grid_conf, data_aug_conf, outC=1, 
-                                                    device=device, distributed=is_distributed, gpu=gpu)
+                                                    device=device, distributed=distributed, gpu=gpu)
 
     opt = torch.optim.Adam(model_without_ddp.parameters(), lr=lr, weight_decay=weight_decay)
+    if backbone:
+        print(f'** Info ** loading backbone {backbone}')
+        model_without_ddp.camencode.trunk.load_state_dict(torch.load(backbone), strict=False)
 
+    init_counter = 0
+    init_epoch = 0
     if modelf:
-        model_without_ddp.load_state_dict(torch.load(modelf))
-        opt.load_state_dict(torch.load(modelf.replace('model', 'opt')))
+        if not os.path.exists(modelf):
+            print(f'** Warning ** {modelf} is not exist')
+        else:
+            ckpt = torch.load(modelf)
+            print('** Info ** loading model', ckpt['model'])
+
+            model_without_ddp.load_state_dict(torch.load(ckpt['model']))
+            opt.load_state_dict(torch.load(ckpt['opt']))
+            init_epoch = int(ckpt['epoch'])
+            init_counter = int(ckpt['counter'])
+
 
     loss_fn = SimpleLoss(pos_weight).to(gpu)
 
     writer = SummaryWriter(logdir=logdir)
-    val_step = 50 if version == 'mini' else 500
+    val_step = 50 if version == 'mini' else 1000
 
-    total = trainloader.batch_sampler.sampler.num_samples
-    print(get_rank(), f'per subdataset numbers:{trainloader.batch_sampler.sampler.num_samples}')
+    total = len(trainloader)
+    print(get_rank(), f'per subdataset numbers:{total}')
 
     model.train()
-    counter = 0
-    for epoch in range(nepochs):
-        if is_distributed:
+    counter = init_counter
+
+    for epoch in range(init_epoch, nepochs):
+        if distributed:
             trainloader.batch_sampler.sampler.set_epoch(epoch)
 
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in enumerate(trainloader):
@@ -132,7 +148,7 @@ def train(version,
 
             if counter % 10 == 0:
                 if is_main_process():
-                    print(f'rank:{get_rank()} epoch:{epoch} counter:{counter} prog: {(100 * batchi * bsz / total):.2f}% loss:{loss.item():.3f} {((t1 - t0)):.2f}s/it')
+                    print(f'rank:{get_rank()} epoch:{epoch} counter:{counter} prog: {(100 * batchi / total):.2f}% loss:{loss.item():.3f} {((t1 - t0)):.2f}s/it')
                     writer.add_scalar('train/loss', loss, counter)
 
             if counter % 50 == 0:
@@ -150,15 +166,21 @@ def train(version,
                     writer.add_scalar('val/iou', val_info['iou'], counter)
 
             if counter % val_step == 0:
-                model_without_ddp.eval()
-                mname = os.path.join(logdir, "model{}.pt".format(counter))
-                print('saving', mname)
-                save_on_master(model_without_ddp.state_dict(), mname)
-                shutil.copy(mname, os.path.join(logdir, "model_latest.pt"))
+                if is_main_process():
+                    model_without_ddp.eval()
+                    mname = os.path.join(logdir, "model{}.pt".format(counter))
+                    print('saving', mname)
+                    torch.save(model_without_ddp.state_dict(), mname)
+                    model_without_ddp.train()
 
-                oname = os.path.join(logdir, "opt{}.pt".format(counter))
-                print('saving', oname)
-                save_on_master(opt.state_dict(), oname)
-                shutil.copy(oname, os.path.join(logdir, "opt_latest.pt"))
-                
-                model_without_ddp.train()
+                    oname = os.path.join(logdir, "opt{}.pt".format(counter))
+                    print('saving', oname)
+                    torch.save(opt.state_dict(), oname)
+
+                    # ckpt
+                    ckpt = {'epoch': epoch,
+                            'counter':counter,
+                            'model': mname,
+                            'opt': oname}
+                    torch.save(ckpt, os.path.join(logdir, "ckpt"))
+                    
